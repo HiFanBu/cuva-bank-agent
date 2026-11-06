@@ -21,6 +21,14 @@ def test_health(conn):
     assert resp.json() == {"status": "ok"}
 
 
+def test_demo_console_is_served(conn):
+    client = _client(conn, FakeLLM())
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "/chat/confirm" in resp.text
+
+
 def test_chat_requires_auth(conn):
     client = _client(conn, FakeLLM())
     resp = client.post("/chat", json={"conversation_id": "c1", "message": "hi"})

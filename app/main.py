@@ -3,8 +3,10 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 
 from app.agent import AgentError, confirm_payment, run_turn
 from app.auth import get_current_user_id
@@ -41,6 +43,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CuVA-style Credit Card Agent (Phase 1)", lifespan=lifespan)
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    """Demo chat console. Not part of the spec's API surface."""
+    return FileResponse(_STATIC_DIR / "index.html")
 
 
 @app.get("/health")

@@ -53,3 +53,28 @@ def log_conversation_message(
         (conversation_id, user_id, role, redact_pii(content), _now()),
     )
     conn.commit()
+
+
+def load_recent_messages(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    user_id: str,
+    limit: int = 10,
+) -> list[dict[str, str]]:
+    """Prior turns of this conversation, oldest first, for model context.
+
+    Scoped by `user_id` as well as `conversation_id`, so a caller who
+    guesses or reuses another customer's conversation_id gets nothing back.
+    Content is already PII-redacted at write time (see
+    `log_conversation_message`), so it is safe to hand to the model.
+    """
+    rows = conn.execute(
+        """
+        SELECT role, content FROM conversation_messages
+        WHERE conversation_id = ? AND user_id = ?
+        ORDER BY id DESC LIMIT ?
+        """,
+        (conversation_id, user_id, limit),
+    ).fetchall()
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]

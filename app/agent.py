@@ -28,7 +28,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from app.audit import log_conversation_message, log_event
+from app.audit import load_recent_messages, log_conversation_message, log_event
 from app.config import settings
 from app.guardrails.input_guard import redact_pii, run_input_guard
 from app.guardrails.output_guard import check_final_answer
@@ -127,6 +127,12 @@ def run_turn(
     message: str,
     trace_id: str,
 ) -> ChatResponse:
+    # Earlier turns give the model enough context for multi-turn requests
+    # ("I want to pay my bill" -> "how much?" -> "$500 on Friday"). Loaded
+    # before logging the current message so it isn't duplicated.
+    prior_turns = load_recent_messages(
+        conn, conversation_id=conversation_id, user_id=user_id
+    )
     log_conversation_message(
         conn, conversation_id=conversation_id, user_id=user_id, role="user", content=message
     )
@@ -160,7 +166,7 @@ def run_turn(
         )
         return resp
 
-    history: list[dict[str, Any]] = [{"role": "user", "content": message}]
+    history: list[dict[str, Any]] = [*prior_turns, {"role": "user", "content": message}]
     used_policy_tool = False
 
     for _ in range(settings.max_agent_steps):

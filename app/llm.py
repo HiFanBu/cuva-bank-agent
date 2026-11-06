@@ -163,33 +163,188 @@ class FakeLLM(LLMProvider):
                 "summary": "Customer reports: " + user_message[:300],
             }
 
+        policy_hit = re.search(_POLICY_TOPIC_RE, lowered) is not None
+        pay_context = _payment_context(history)
+        if pay_context is not None:
+            amount_cents, pay_date = _extract_payment_slots(pay_context)
+            # "How is my minimum payment calculated?" is a policy question,
+            # not a request to move money, unless the user gave an amount/date.
+            asks_due = re.search(r"\b(due|when is)\b", lowered) is not None
+            no_slots = amount_cents is None and pay_date is None
+            if no_slots and policy_hit:
+                return {"type": "tool_call", "tool": "search_policy", "args": {"query": user_message}}
+            if no_slots and asks_due:
+                return {"type": "tool_call", "tool": "get_balance", "args": {}}
+            if amount_cents is not None and pay_date is not None:
+                return {
+                    "type": "tool_call",
+                    "tool": "schedule_payment",
+                    "args": {"amount_cents": amount_cents, "pay_date": pay_date},
+                }
+            return {"type": "final", "message": _ask_for_payment_slots(amount_cents, pay_date), "citations": []}
+
         if re.search(r"\b(balance|owe|current balance)\b", lowered):
             return {"type": "tool_call", "tool": "get_balance", "args": {}}
 
         if re.search(r"\b(transaction|transactions|statement)\b", lowered):
             return {"type": "tool_call", "tool": "get_transactions", "args": {"limit": 10}}
 
-        pay_match = re.search(r"\$?\s*([\d,]+(?:\.\d{2})?)", user_message)
-        date_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", user_message)
-        if re.search(r"\b(pay|payment|schedule|autopay)\b", lowered) and pay_match and date_match:
-            amount = float(pay_match.group(1).replace(",", ""))
-            return {
-                "type": "tool_call",
-                "tool": "schedule_payment",
-                "args": {
-                    "amount_cents": int(round(amount * 100)),
-                    "pay_date": date_match.group(1),
-                },
-            }
-
         if re.search(r"\b(late fee|apr|interest|grace period|minimum payment|credit limit|rewards|annual fee)\b", lowered):
             return {"type": "tool_call", "tool": "search_policy", "args": {"query": user_message}}
+
+        if re.search(_SMALL_TALK_RE, lowered):
+            return {"type": "final", "message": _INTRO_MESSAGE, "citations": []}
 
         return {
             "type": "handoff",
             "reason": "low_confidence",
             "summary": "Could not confidently classify request: " + user_message[:300],
         }
+
+
+# ---------------------------------------------------------------------------
+# FakeLLM heuristic helpers (demo/eval only -- a real model replaces all this)
+# ---------------------------------------------------------------------------
+
+_POLICY_TOPIC_RE = r"\b(late fee|apr|interest|grace period|minimum payment|credit limit|rewards|annual fee)\b"
+_PAY_INTENT_RE = r"\b(pay|paying|payment|repay|pay off|autopay)\b"
+_SMALL_TALK_RE = (
+    r"^\s*(hi|hello|hey|yo|good (morning|afternoon|evening))\b|"
+    r"\bwho (are|r) (you|u)\b|\bwhat can you do\b|^\s*help\s*[?!.]*$"
+)
+_PAYMENT_PROMPT_PREFIX = "Sure, I can schedule a payment"
+_INTRO_MESSAGE = (
+    "Hi, I'm the card support assistant. I can answer questions about your "
+    "card terms, show your balance and recent transactions, and schedule a "
+    "payment (you confirm before anything is submitted). For complaints, "
+    "disputes or fraud I'll connect you with a specialist."
+)
+
+_MONTHS = {
+    m: i
+    for i, names in enumerate(
+        [
+            ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+            ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+            ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+            ("dec", "december"),
+        ],
+        start=1,
+    )
+    for m in names
+}
+_MONTH_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_MONTH_DAY_RE = re.compile(rf"\b({_MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", re.IGNORECASE)
+_DAY_MONTH_RE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_ALT})\b", re.IGNORECASE)
+_SLASH_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
+_RELATIVE_RE = re.compile(r"\b(today|tomorrow)\b", re.IGNORECASE)
+_AMOUNT_RE = re.compile(
+    r"\$\s*(\d[\d,]*(?:\.\d{1,2})?)|(\d[\d,]*(?:\.\d{1,2})?)\s*(?:dollars?|usd|bucks)\b|(\d[\d,]*(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+
+
+def _payment_context(history: list[dict[str, Any]]) -> str | None:
+    """Text of the payment request being assembled, or None if this turn
+    isn't about scheduling a payment.
+
+    Starts from the current user message and walks back through earlier
+    turns as long as each preceding assistant reply was one of our own
+    "how much / which date?" follow-ups, so slots given across several
+    messages are combined.
+    """
+    convo = [e for e in history if e["role"] in ("user", "assistant")]
+    if not convo or convo[-1]["role"] != "user":
+        return None
+    parts = [str(convo[-1]["content"])]
+    in_payment_flow = False
+    i = len(convo) - 2
+    while i >= 1:
+        prev_bot, prev_user = convo[i], convo[i - 1]
+        if prev_bot["role"] != "assistant" or not str(prev_bot["content"]).startswith(_PAYMENT_PROMPT_PREFIX):
+            break
+        in_payment_flow = True
+        parts.insert(0, str(prev_user["content"]))
+        i -= 2
+    current = parts[-1]
+    has_intent = re.search(_PAY_INTENT_RE, current.lower()) is not None
+    if not has_intent:
+        if not in_payment_flow:
+            return None
+        # Mid-flow, a message with no amount/date and no payment wording
+        # ("actually, what's my balance?") means the user changed topic.
+        if _extract_payment_slots(current) == (None, None):
+            return None
+    return " \n ".join(parts)
+
+
+def _resolve_month_day(month: int, day: int, today: "date") -> "date | None":
+    from datetime import date
+
+    try:
+        candidate = date(today.year, month, day)
+    except ValueError:
+        return None
+    if candidate < today:
+        try:
+            candidate = date(today.year + 1, month, day)
+        except ValueError:
+            return None
+    return candidate
+
+
+def _extract_payment_slots(text: str) -> tuple[int | None, str | None]:
+    """Pull (amount_cents, YYYY-MM-DD) out of free text. Later mentions win,
+    so a user can correct an earlier answer. Date text is removed before
+    looking for the amount so "Nov 20" never becomes $20."""
+    from datetime import date, timedelta
+
+    today = date.today()
+    found: list[tuple[int, date]] = []  # (position, date)
+    remaining = text
+
+    def take(regex: re.Pattern, to_date) -> None:
+        nonlocal remaining
+        for m in regex.finditer(remaining):
+            d = to_date(m)
+            if d is not None:
+                found.append((m.start(), d))
+        remaining = regex.sub(lambda m: " " * len(m.group(0)), remaining)
+
+    def iso(m):
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+
+    take(_ISO_DATE_RE, iso)
+    take(_MONTH_DAY_RE, lambda m: _resolve_month_day(_MONTHS[m.group(1).lower()], int(m.group(2)), today))
+    take(_DAY_MONTH_RE, lambda m: _resolve_month_day(_MONTHS[m.group(2).lower()], int(m.group(1)), today))
+    take(_SLASH_DATE_RE, lambda m: _resolve_month_day(int(m.group(1)), int(m.group(2)), today))
+    take(_RELATIVE_RE, lambda m: today + timedelta(days=1 if m.group(1).lower() == "tomorrow" else 0))
+
+    pay_date = max(found)[1].isoformat() if found else None
+
+    amount_cents = None
+    explicit = [m for m in _AMOUNT_RE.finditer(remaining) if m.group(1) or m.group(2)]
+    matches = explicit or list(_AMOUNT_RE.finditer(remaining))
+    if matches:
+        raw = next(g for g in matches[-1].groups() if g)
+        try:
+            amount_cents = int(round(float(raw.replace(",", "")) * 100))
+        except ValueError:
+            amount_cents = None
+    return amount_cents, pay_date
+
+
+def _ask_for_payment_slots(amount_cents: int | None, pay_date: str | None) -> str:
+    example = "for example \"$500 on Nov 20\", \"tomorrow\" or \"2026-11-20\""
+    if amount_cents is None and pay_date is None:
+        return f"{_PAYMENT_PROMPT_PREFIX}. How much would you like to pay, and on what date? ({example})"
+    if amount_cents is None:
+        return f"{_PAYMENT_PROMPT_PREFIX} on {pay_date}. How much would you like to pay?"
+    return f"{_PAYMENT_PROMPT_PREFIX} of ${amount_cents / 100:,.2f}. On what date? ({example})"
 
 
 class OllamaProvider(LLMProvider):
