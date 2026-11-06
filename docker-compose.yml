@@ -1,0 +1,15 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=fake
+      - DB_PATH=/data/cuva.db
+      - PENDING_ACTION_TTL_SECONDS=600
+      - MAX_AGENT_STEPS=6
+    volumes:
+      - cuva_data:/data
+
+volumes:
+  cuva_data:
